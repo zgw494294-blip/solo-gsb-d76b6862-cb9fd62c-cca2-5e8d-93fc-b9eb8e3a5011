@@ -141,6 +141,13 @@ function loadApp(search = "") {
     "script-state",
     "script-records",
     "error-script",
+    "query",
+    "query-input",
+    "query-submit",
+    "query-cancel",
+    "query-state",
+    "query-result",
+    "error-query",
   ]) {
     get(id);
   }
@@ -297,6 +304,7 @@ function statusBody(expId, opts = {}) {
     b: side(opts.bRead, opts.bLog, opts.bTx, opts.bRo),
     checkpoint: { last: opts.ckptLast || null, log: opts.ckptLog || [] },
     script: opts.script === undefined ? null : opts.script,
+    query: opts.query === undefined ? null : opts.query,
   };
 }
 

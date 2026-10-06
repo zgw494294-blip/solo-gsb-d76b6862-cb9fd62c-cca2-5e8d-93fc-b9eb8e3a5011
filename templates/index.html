@@ -140,6 +140,29 @@
     <ol class="log timeline-log" id="timeline-list"></ol>
   </section>
 
+  <section class="query" id="query">
+    <h2>只读 SQL 工作台（独立只读连接 · 单条 SELECT / WITH · 可取消）</h2>
+    <p class="query-hint">提交 1～4000 字符的单条 <code>SELECT</code> / <code>WITH</code>
+       查询：禁止写入、<code>PRAGMA</code>、<code>ATTACH</code> 与扩展加载（文本校验 +
+       独立只读连接 <code>PRAGMA query_only=1</code> + 只读授权器三重保证）。每实验只保留
+       最新查询，运行中再提交返回 409；提交立即返回查询 ID，状态随轮询更新（运行中 /
+       成功 / 失败 / 已取消）。结果含列名、前 100 行与截断标志，整数无损、BLOB 转
+       十六进制。取消真实中断 SQL（尚未开跑也取消），连接关闭后才公布终态；取消先被
+       确认则不得成功，已终结不改结果，旧查询 ID 返回 404。查询不触碰两栏事务、快照
+       与最近读值，失败或取消不改值及时间线；查询状态不跨重启保留。</p>
+    <div class="controls">
+      <textarea id="query-input" rows="4" spellcheck="false"
+        placeholder="SELECT * FROM kv"></textarea>
+    </div>
+    <div class="controls">
+      <button type="button" id="query-submit">提交查询</button>
+      <button type="button" class="danger" id="query-cancel">取消查询</button>
+      <span class="query-state" id="query-state">尚未提交查询</span>
+    </div>
+    <div class="error-box" id="error-query" hidden></div>
+    <div class="query-result" id="query-result"></div>
+  </section>
+
   <footer>
     <p>说明：状态刷新不执行任何 SELECT，不会为 DEFERRED 事务提前建立快照，也不触发检查点
        （检查点结果只读内存缓存）；写锁冲突会立即返回

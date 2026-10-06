@@ -89,11 +89,20 @@
   （Compose 以命名卷 `lab-data` 挂载 `/app/data`），**启动不再清空目录**，
   服务重启或进程被强制终止（`kill -9`）后按**原实验 ID** 即可继续访问：
   完整时间线（含补偿关联与序号）恢复、编号接续、末条普通记录仍可补偿；
-  两栏重建为**无事务、只读关闭、最近读值为空**，脚本、操作日志与检查点
-  缓存不恢复。普通提交与补偿都把「值 + 时间线记录」放在**同一事务**提交，
-  进程任意时刻终止后只能恢复二者都生效或都未生效的状态，不依赖退出清理；
-  旧版库（无 `timeline` 表）首次加载保留现值，以空时间线为基线。详见下文
-  「跨重启与强制终止恢复」
+  两栏重建为**无事务、只读关闭、最近读值为空**，脚本、操作日志、检查点
+  缓存与查询状态不恢复。普通提交与补偿都把「值 + 时间线记录」放在
+  **同一事务**提交，进程任意时刻终止后只能恢复二者都生效或都未生效的
+  状态，不依赖退出清理；旧版库（无 `timeline` 表）首次加载保留现值，
+  以空时间线为基线。详见下文「跨重启与强制终止恢复」
+- **只读 SQL 工作台**（页面底部区块，`POST /api/experiments/<id>/query`）：
+  在**独立只读连接**上真实执行单条 `SELECT` / `WITH` 查询（1～4000 字符，
+  禁止写入、`PRAGMA`、`ATTACH` 与扩展加载），不触碰两栏事务、读快照与
+  最近显式读值；**每实验只保留最新查询**，运行中再提交 `409`，提交立即
+  返回查询 ID，可轮询**运行中 / 成功 / 失败 / 已取消**；结果含列名、
+  前 100 行与截断标志（整数无损、BLOB 转十六进制）；**可取消**——真实
+  中断 SQL，尚未开跑也取消，连接关闭后才公布终态；旧查询 ID `404`；
+  删除实验先取消在途查询、等连接关闭再删文件；查询状态不跨重启保留。
+  详见下文「只读 SQL 工作台」
 
 ## 脚本逐步执行
 
@@ -130,6 +139,109 @@
   脚本响应不影响新实验；两栏手工控件在脚本有效期间禁用并随轮询自动
   锁定 / 恢复；原有手工接口、检查点、时间线、删除接口与整数无损约定
   全部保留不变
+
+## 只读 SQL 工作台
+
+实验页底部区块与 HTTP 提供**可取消的只读 SQL 工作台**：在**独立只读
+连接**上真实执行单条 `SELECT` / `WITH` 查询，不触碰两栏长期连接与
+observer——两栏事务、读快照与最近显式读值都不受影响。
+
+- 提交（`POST /api/experiments/<id>/query`，body `{"sql": "..."}`）：
+  SQL 限 **1～4000 字符**、**只许一条 SELECT / WITH 查询**（分号仅可
+  出现在末尾），**禁止写入、`PRAGMA`、`ATTACH` 与扩展加载**——文本校验
+  （先剥离字符串字面量、引用标识符与注释再扫描关键字）之外，执行时还有
+  独立只读连接 `PRAGMA query_only=1` 与**只读授权器**（仅放行 SELECT /
+  READ / RECURSIVE 及非 load_extension 的函数）双重保证，任何写操作都
+  不可能生效。非法 SQL 一律 `400`，不产生查询
+- **每实验只保留最新查询**：**运行中再提交返回 `409`**（响应附当前查询
+  视图）；**提交立即返回查询 ID**，执行在后台线程的独立只读连接上进行
+- 查结果（`GET …/query` 当前最新、无查询为 `null`；`GET …/query/<id>`；
+  也随 `/status` 的 `query` 字段轮询返回）：**运行中 / 成功 / 失败 /
+  已取消**。成功含**列名、前 100 行与截断标志**，整数沿用无损编码
+  （大整数十进制字符串）、**BLOB 转十六进制**；失败如实携带 SQLite
+  错误名 / 错误码；查询只读内存，不执行任何 SQL
+- 取消（`POST …/query/<id>/cancel`）：**真实中断 SQL**
+  （`conn.interrupt()`，运行中的长查询被 `SQLITE_INTERRUPT` 打断），
+  **尚未开跑也取消**；**终态一律在连接关闭后才公布**——**取消先被确认
+  则不得成功**（执行完成但公布前取消被确认，结果作废改公布取消），
+  **已终结则不改结果**（重复取消返回 `200` 与原终态）
+- **旧查询 ID**（已被新查询替换）查询 / 取消一律 `404`，不影响新查询
+- **删除实验先取消在途查询、等连接关闭再删文件**，等待按实验独立，
+  **不阻塞其他实验**；**失败或取消不改值及时间线**
+- 查询状态只保存在内存，**不跨重启保留**；脚本有效期间工作台不受影响
+  （与检查点同理：独立连接，不碰两栏）
+- 页面控件遵守：**新建实验进行中禁用**、**删除后冻结**、旧实验的迟到
+  查询响应不影响新实验；原有手工 / 脚本 / 检查点 / 时间线 / 删除接口
+  与行为全部不变
+
+### HTTP 示例：查询、取消与删除交错
+
+```bash
+EXP=$(curl -s -X POST http://localhost:8000/api/experiments \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+BASE=http://localhost:8000/api/experiments/$EXP
+
+# 提交：立即返回查询 ID（后台线程的独立只读连接真实执行）
+curl -s -X POST $BASE/query -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT id, val FROM kv"}'
+# {"ok":true,"query":{"id":"a1b2c3d4e5f6","status":"running",
+#  "sql":"SELECT id, val FROM kv","cancel_requested":false}}
+QID=a1b2c3d4e5f6
+
+# 查结果：运行中 / 成功 / 失败 / 已取消；成功含列名、前 100 行与截断标志
+curl -s $BASE/query/$QID
+# {"query":{"id":"a1b2c3d4e5f6","status":"success","sql":"SELECT id, val FROM kv",
+#  "columns":["id","val"],"rows":[[1,100]],"truncated":false}}
+curl -s $BASE/query            # 当前最新查询（无查询为 {"query":null}）
+curl -s $BASE/status           # query 字段随状态轮询返回
+
+# 整数无损（大整数十进制字符串）、BLOB 转十六进制
+curl -s -X POST $BASE/query -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT 9007199254741093 AS big, x'"'"'AB01FF'"'"' AS blob"}'
+# 成功后 rows → [["9007199254741093","AB01FF"]]
+
+# 非法 SQL 一律 400：写入 / PRAGMA / ATTACH / 扩展加载 / 多条 / 超长
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/query \
+  -H 'Content-Type: application/json' -d '{"sql":"PRAGMA journal_mode"}'   # 400
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/query \
+  -H 'Content-Type: application/json' -d '{"sql":"DELETE FROM kv"}'        # 400
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/query \
+  -H 'Content-Type: application/json' -d '{"sql":"SELECT 1; SELECT 2"}'    # 400
+
+# 长查询交错：运行中再提交 409；取消真实中断 SQL，连接关闭后公布已取消
+curl -s -X POST $BASE/query -H 'Content-Type: application/json' -d '{"sql":
+  "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<500000000)
+   SELECT count(*) FROM c"}'
+QID2=<上一步返回的查询 id>
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/query \
+  -H 'Content-Type: application/json' -d '{"sql":"SELECT 1"}'              # 409
+curl -s -X POST $BASE/query/$QID2/cancel
+# {"ok":true,"query":{"id":"...","status":"running","cancel_requested":true,...}}
+curl -s $BASE/query/$QID2
+# {"query":{"id":"...","status":"cancelled",...}}   连接关闭后才公布终态
+curl -s -X POST $BASE/query/$QID2/cancel   # 已终结不改结果：200 仍为 cancelled
+
+# 旧查询 ID（已被新查询替换）：404，不影响新查询
+curl -s -X POST $BASE/query -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT 1"}'
+curl -s -o /dev/null -w "%{http_code}\n" $BASE/query/$QID2                 # 404
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/query/$QID2/cancel  # 404
+
+# 删除与在途查询交错：先取消在途查询、等连接关闭再删文件；不阻塞其他实验
+curl -s -X POST $BASE/query -H 'Content-Type: application/json' -d '{"sql":
+  "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<500000000)
+   SELECT count(*) FROM c"}'
+curl -s -X DELETE $BASE        # 在途查询被真实中断，连接关闭后才删除文件
+# {"deleted":true,"id":"..."}
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/query \
+  -H 'Content-Type: application/json' -d '{"sql":"SELECT 1"}'              # 410
+```
+
+> 查询在独立只读连接上只见**已提交**数据：两栏事务内未提交的修改对
+> 工作台不可见；两栏的写锁、读快照与最近显式读值都不受查询影响，
+> 失败或取消的查询同样不改值及时间线。删除等待期间该实验的查询新请求
+> 一律 `410`，其他实验的查询与操作照常。
+
 
 ## 手工请求与脚本装载的互斥（后端卡死修复）
 
@@ -351,8 +463,8 @@ docker compose up --build
 - 已提交值就在 `kv` 表中，原样恢复；
 - 提交时间线从 `timeline` 表完整恢复（含补偿关联 `compensates` 与序号
   `seq`），编号接续，末条普通记录仍可补偿；
-- 两栏重建为**无事务、只读关闭、最近读值为空**；脚本、操作日志与检查点
-  缓存不恢复（全新内存状态）；
+- 两栏重建为**无事务、只读关闭、最近读值为空**；脚本、操作日志、检查点
+  缓存与查询状态不恢复（全新内存状态）；
 - 未提交事务随进程死亡回滚，恢复后不可见；
 - 成功删除的实验库文件已移除，**不会复活**（重启后按未知 ID 返回 404）；
 - 旧版库（无 `timeline` 表）首次加载保留现值，以空时间线为基线。
@@ -424,11 +536,11 @@ curl -s $BASE/timeline
 # [#1 a 100→112 [5,7], #2 system 112→100 [-7,-5] compensates:1,
 #  #3 a 100→103 [3], #4 b 103→113 [10]]
 
-# 两栏已重建为无事务、只读关闭、最近读值为空；脚本 / 日志 / 检查点缓存为空
+# 两栏已重建为无事务、只读关闭、最近读值为空；脚本 / 日志 / 检查点缓存 / 查询为空
 curl -s $BASE/status
 # {"a":{"in_transaction":false,"readonly":false,"last_read":null,"log":[]},
 #  "b":{...同样为空...},"checkpoint":{"last":null,"log":[]},
-#  "script":null,"timeline":[...]}
+#  "script":null,"query":null,"timeline":[...]}
 
 # 末条普通记录仍可补偿
 curl -s -X POST $BASE/timeline/compensate \
@@ -594,6 +706,32 @@ python3 tests/backend_persist.py
 
 ```bash
 node tests/compensate.test.js
+```
+
+`tests/backend_query.py` 用同一个 stub 驱动实际路由，覆盖只读 SQL 工作台：
+文本校验各分支（多条 / 写入 / PRAGMA / ATTACH / 扩展加载 / 超长一律 400，
+字面量与注释中的分号不误伤）、提交立即返回查询 ID、列名 + 前 100 行 +
+截断标志、大整数无损与 BLOB 十六进制、运行中再提交 409（含并发）、旧查询
+ID 404、取消真实中断运行中的长查询（SQLITE_INTERRUPT）、尚未开跑也取消
+（闸门按住 worker）、取消先被确认则不得成功（闸门按在公布前）、已终结
+不改结果、连接关闭后才公布终态、查询不触碰两栏事务 / 快照 / 最近读值、
+失败与取消不改值及时间线、删除先取消在途查询并等连接关闭再删文件（不阻塞
+其他实验）、删除后 410、未知实验 404、查询状态不跨重启保留：
+
+```bash
+python3 tests/backend_query.py
+```
+
+`tests/query.test.js` 用假 `fetch` 环境覆盖 SQL 工作台控件的前端行为：
+本地校验（空 / 超长不发请求）、提交在途禁用、运行中只能取消（取消已确认
+后不再重复取消）、成功渲染列名 + 行（大整数字符串、NULL）+ 截断标志、
+失败如实显示错误名 / 码、400 如实显示服务端原因、409（运行中再提交）与
+旧查询 ID（404）本地不猜测并立即以服务端状态重核对（旧查询 ID 不自动
+新建）、新建进行中禁用、删除后冻结（点击不发请求）、旧实验迟到响应不
+影响新实验、410 冻结：
+
+```bash
+node tests/query.test.js
 ```
 
 ## 操作示例

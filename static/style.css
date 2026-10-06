@@ -395,6 +395,125 @@ button.danger:hover:not(:disabled) {
   width: 110px;
 }
 
+.query {
+  background: #fff;
+  border: 1px solid #e2e5ea;
+  border-radius: 8px;
+  margin: 0 20px 16px;
+  padding: 14px 16px;
+}
+
+.query h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+
+.query h2 code {
+  background: #f1f3f7;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.query-hint {
+  font-size: 12.5px;
+  color: #6b7280;
+  margin: 8px 0;
+  line-height: 1.7;
+}
+
+.query-hint code {
+  background: #f1f3f7;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+#query-input {
+  width: 100%;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12.5px;
+  padding: 8px 10px;
+  border: 1px solid #cbd2da;
+  border-radius: 6px;
+  resize: vertical;
+}
+
+#query-input:disabled {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+.query-state {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  color: #374151;
+}
+
+.query-state.running {
+  color: #2563eb;
+  font-weight: bold;
+}
+
+.query-state.success {
+  color: #047857;
+  font-weight: bold;
+}
+
+.query-state.failed {
+  color: #b91c1c;
+  font-weight: bold;
+}
+
+.query-state.cancelled {
+  color: #b45309;
+  font-weight: bold;
+}
+
+.query-result {
+  margin-top: 8px;
+  overflow-x: auto;
+}
+
+.query-table {
+  border-collapse: collapse;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.query-table th,
+.query-table td {
+  border: 1px solid #e2e5ea;
+  padding: 4px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.query-table th {
+  background: #f1f3f7;
+}
+
+.query-table td.query-null {
+  color: #9ca3af;
+  font-style: italic;
+}
+
+.query-foot {
+  font-size: 12.5px;
+  color: #6b7280;
+  margin-top: 6px;
+}
+
+.query-failure {
+  color: #b91c1c;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+}
+
+.query-cancelled {
+  color: #b45309;
+  font-size: 13px;
+}
+
 footer {
   padding: 0 20px 16px;
   color: #6b7280;

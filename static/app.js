@@ -31,6 +31,11 @@ let scriptState = null;
 let scriptBusy = false;
 // 补偿请求在途：禁用时间线区块的补偿输入与按钮（不影响两栏与检查点）。
 let compensateBusy = false;
+// 最近一次状态轮询 / 查询响应确认的查询视图（null = 无查询）。
+// 每实验只保留最新查询，旧查询 ID 在服务端返回 404。
+let queryState = null;
+// 查询请求（提交 / 取消）在途：禁用工作台全部控件。
+let queryBusy = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -76,6 +81,7 @@ function freezeExperiment(reason) {
   setBusy("b", true);
   setCheckpointBusy(true);
   setCompensateBusy(true);
+  setQueryBusy(true);
   $("refresh-committed").disabled = true;
   $("delete-exp").disabled = true;
   $("panel-a").classList.add("exp-frozen");
@@ -83,6 +89,7 @@ function freezeExperiment(reason) {
   $("checkpoint").classList.add("exp-frozen");
   $("timeline").classList.add("exp-frozen");
   $("script").classList.add("exp-frozen");
+  $("query").classList.add("exp-frozen");
   scriptState = null;
   scriptBusy = false;
   syncPanelControls();
@@ -119,6 +126,7 @@ async function createExperiment() {
   $("checkpoint").classList.remove("exp-frozen");
   $("timeline").classList.remove("exp-frozen");
   $("script").classList.remove("exp-frozen");
+  $("query").classList.remove("exp-frozen");
   panelBusy.a = false;
   panelBusy.b = false;
   scriptState = null;
@@ -127,6 +135,7 @@ async function createExperiment() {
   setBusy("b", true);
   setCheckpointBusy(true);
   setCompensateBusy(true);
+  setQueryBusy(true);
   syncScriptControls();
   $("refresh-committed").disabled = true;
   $("delete-exp").disabled = true;
@@ -157,6 +166,7 @@ async function createExperiment() {
       setBusy("b", false);
       setCheckpointBusy(false);
       setCompensateBusy(false);
+      setQueryBusy(false);
       syncScriptControls();
       $("refresh-committed").disabled = false;
       $("delete-exp").disabled = false;
@@ -220,11 +230,21 @@ async function createExperiment() {
   $("script-state").className = "script-state";
   $("script-records").innerHTML = "";
   clearError("script");
+  // 新实验无查询：清空工作台并恢复「提交查询」可用（查询不跨实验保留）
+  queryState = null;
+  queryBusy = false;
+  $("query-input").value = "";
+  $("query-state").textContent = "尚未提交查询";
+  $("query-state").className = "query-state";
+  $("query-state").classList.remove("running", "success", "failed", "cancelled");
+  $("query-result").innerHTML = "";
+  clearError("query");
 
   setBusy("a", false);
   setBusy("b", false);
   setCheckpointBusy(false);
   setCompensateBusy(false);
+  setQueryBusy(false);
   syncScriptControls();
   $("refresh-committed").disabled = false;
   $("delete-exp").disabled = false;
@@ -267,6 +287,8 @@ async function refreshStatus(gen, opts = {}) {
     renderTimeline(data.timeline);
     // 脚本状态来自内存：轮询不在两栏连接上额外读值
     renderScript(data.script === undefined ? null : data.script);
+    // 查询状态同样只读内存：轮询不执行任何 SQL
+    renderQuery(data.query === undefined ? null : data.query);
   } catch (e) {
     if (e instanceof ExpDeleted) {
       if (gen === expGen) {
@@ -901,6 +923,217 @@ async function doCompensate() {
   }
 }
 
+const QUERY_STATUS_LABELS = {
+  running: "运行中",
+  success: "成功",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
+function renderQuery(state) {
+  // 只渲染服务端内存中的查询视图：轮询本身不执行任何 SQL。
+  // queryState 更新后统一同步工作台控件可用性。
+  queryState = state || null;
+  const stateEl = $("query-state");
+  const resultEl = $("query-result");
+  resultEl.innerHTML = "";
+  if (!queryState) {
+    stateEl.textContent = "尚未提交查询";
+    stateEl.className = "query-state";
+    stateEl.classList.remove("running", "success", "failed", "cancelled");
+    syncQueryControls();
+    return;
+  }
+  const label = QUERY_STATUS_LABELS[queryState.status] || queryState.status;
+  stateEl.textContent =
+    `查询 ${queryState.id}：${label}` +
+    (queryState.status === "running" && queryState.cancel_requested
+      ? "（取消已确认，等待连接关闭后公布终态）"
+      : "");
+  stateEl.className = "query-state";
+  stateEl.classList.remove("running", "success", "failed", "cancelled");
+  stateEl.classList.add(queryState.status);
+
+  if (queryState.status === "success") {
+    // 列名 + 前 100 行 + 截断标志；整数无损（大整数已是十进制字符串）、
+    // BLOB 已是十六进制字符串，均按文本原样显示
+    const columns = queryState.columns || [];
+    const rows = queryState.rows || [];
+    const table = document.createElement("table");
+    table.classList.add("query-table");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for (const col of columns) {
+      const th = document.createElement("th");
+      th.textContent = col;
+      headRow.appendChild(th);
+    }
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    for (const row of rows) {
+      const tr = document.createElement("tr");
+      for (const value of row) {
+        const td = document.createElement("td");
+        if (value === null) {
+          td.textContent = "NULL";
+          td.classList.add("query-null");
+        } else {
+          td.textContent = String(value);
+        }
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    resultEl.appendChild(table);
+    const foot = document.createElement("div");
+    foot.classList.add("query-foot");
+    foot.textContent = queryState.truncated
+      ? `结果已截断：仅返回前 ${rows.length} 行`
+      : `共 ${rows.length} 行`;
+    resultEl.appendChild(foot);
+  } else if (queryState.status === "failed") {
+    const err = queryState.error || {};
+    const div = document.createElement("div");
+    div.classList.add("query-failure");
+    div.textContent = err.name
+      ? `${err.name}（错误码 ${err.code}）：${err.message}`
+      : err.message || "查询失败";
+    resultEl.appendChild(div);
+  } else if (queryState.status === "cancelled") {
+    const div = document.createElement("div");
+    div.classList.add("query-cancelled");
+    div.textContent = "查询已取消：连接已关闭，未产生结果";
+    resultEl.appendChild(div);
+  }
+  syncQueryControls();
+}
+
+function setQueryBusy(busy) {
+  queryBusy = !!busy;
+  syncQueryControls();
+}
+
+function syncQueryControls() {
+  // 创建中 / 冻结 / 查询请求在途一律禁用；运行中只能取消（取消已确认后
+  // 不再重复取消），其余状态只能提交。可用性以后端状态为准。
+  const frozen = creating || expFrozen || queryBusy;
+  const running = !!(queryState && queryState.status === "running");
+  const cancelling = running && !!queryState.cancel_requested;
+  $("query-input").disabled = frozen || running;
+  $("query-submit").disabled = frozen || running;
+  $("query-cancel").disabled = frozen || !running || cancelling;
+}
+
+// 查询接口的 400（SQL 校验拒绝）：如实显示服务端原因
+class QueryRejected extends Error {}
+// 旧查询 ID（已被新查询替换）：404，不自动新建，以服务端状态重核对
+class QueryStale extends Error {}
+
+async function fetchQueryJson(path, options) {
+  // 与脚本 / 补偿共用的 409 感知类似，但查询按 ID 寻址：404 既可能是
+  // 未知实验（自动新建），也可能是旧查询 ID（不自动新建），按错误消息区分
+  const resp = await fetch(path, options);
+  if (resp.status === 410) throw new ExpDeleted();
+  let body = null;
+  try {
+    body = await resp.json();
+  } catch (e) {
+    body = {};
+  }
+  if (resp.status === 404) {
+    if (body && body.error === "query not found") throw new QueryStale(body.error);
+    throw new ExpNotFound();
+  }
+  if (resp.status === 400) throw new QueryRejected((body && body.error) || "HTTP 400");
+  if (resp.status === 409) throw new ScriptConflict((body && body.error) || "conflict");
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  return body;
+}
+
+async function doQuerySubmit() {
+  if (creating || expFrozen) return;
+  const raw = $("query-input").value;
+  if (!raw.trim()) {
+    showError("query", { name: null, code: null, message: "请输入 1～4000 字符的单条 SELECT / WITH 查询" });
+    return;
+  }
+  if (raw.length > 4000) {
+    showError("query", { name: null, code: null, message: "SQL 最长 4000 字符" });
+    return;
+  }
+  const gen = expGen;
+  setQueryBusy(true);
+  clearError("query");
+  try {
+    const data = await fetchQueryJson(`/api/experiments/${expId}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sql: raw }),
+    });
+    if (gen !== expGen) return;
+    renderQuery(data.query);
+  } catch (e) {
+    await handleQueryError(e, gen, "提交查询失败：");
+  } finally {
+    // 冻结 / 已切换到新实验后，迟到响应不得改动当前控件状态
+    if (gen === expGen && !expFrozen) setQueryBusy(false);
+  }
+}
+
+async function doQueryCancel() {
+  if (creating || expFrozen) return;
+  // 本地无运行中查询视图时不发；取消已确认也不重复发
+  if (!queryState || queryState.status !== "running" || queryState.cancel_requested) {
+    return;
+  }
+  const gen = expGen;
+  setQueryBusy(true);
+  clearError("query");
+  try {
+    const data = await fetchQueryJson(
+      `/api/experiments/${expId}/query/${queryState.id}/cancel`,
+      { method: "POST" }
+    );
+    if (gen !== expGen) return;
+    renderQuery(data.query);
+  } catch (e) {
+    await handleQueryError(e, gen, "取消查询失败：");
+  } finally {
+    if (gen === expGen && !expFrozen) setQueryBusy(false);
+  }
+}
+
+async function handleQueryError(e, gen, prefix) {
+  if (e instanceof ExpDeleted) {
+    if (gen === expGen) {
+      freezeExperiment(`实验 ${expId} 已删除（410）：查询操作未执行，旧实验操作已禁用，可点击「新建实验」继续。`);
+    }
+    return;
+  }
+  if (e instanceof ExpNotFound) {
+    if (gen === expGen && !expFrozen) {
+      await newExperiment();
+    }
+    return;
+  }
+  if (gen !== expGen || expFrozen) return;
+  if (e instanceof QueryRejected) {
+    // SQL 校验拒绝（400）：如实显示服务端原因，本地状态不变
+    showError("query", { name: null, code: null, message: prefix + e.message });
+    return;
+  }
+  if (e instanceof ScriptConflict || e instanceof QueryStale) {
+    // 运行中再提交（409）或旧查询 ID（404）：本地不猜测结果，
+    // 立即以服务端状态为准重新核对
+    showError("query", { name: null, code: null, message: prefix + e.message });
+    refreshStatus(gen, { allowAutoCreate: false }).catch(() => {});
+    return;
+  }
+  showError("query", { name: null, code: null, message: prefix + "请求失败：" + e.message });
+}
+
 async function doCheckpoint(mode) {
   if (creating || expFrozen) return;
   const gen = expGen;
@@ -1013,6 +1246,12 @@ async function init() {
   });
   $("script-cancel").addEventListener("click", () => {
     doScriptAction("cancel").catch(() => {});
+  });
+  $("query-submit").addEventListener("click", () => {
+    doQuerySubmit().catch(() => {});
+  });
+  $("query-cancel").addEventListener("click", () => {
+    doQueryCancel().catch(() => {});
   });
 
   const params = new URLSearchParams(location.search);

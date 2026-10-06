@@ -69,13 +69,13 @@ WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而�
 exp_*.db 重新加载，实验在服务重启或进程被强制终止后仍能按原 ID
 访问：已提交值就在 kv 表中，提交时间线从 timeline 表完整恢复
 （含补偿关联 compensates 与序号 seq），编号接续，末条普通记录仍可
-补偿；两栏重建为无事务、只读关闭、最近读值为空，脚本、操作日志与
-检查点缓存不恢复（全新内存状态）。普通提交与补偿都把「值 + 时间线
-记录」放在同一事务提交：进程在任意时刻被终止（含 kill -9），重启后
-只能恢复到二者都生效或都未生效的状态，绝不依赖退出清理。失败提交
-保留原事务与重试能力：记录 INSERT 随 SAVEPOINT 回滚撤销，重试时
-重新写入，绝不重复记录。旧版库（无 timeline 表）首次加载保留现值，
-以空时间线为基线。
+补偿；两栏重建为无事务、只读关闭、最近读值为空，脚本、操作日志、
+检查点缓存与查询状态不恢复（全新内存状态）。普通提交与补偿都把
+「值 + 时间线记录」放在同一事务提交：进程在任意时刻被终止（含
+kill -9），重启后只能恢复到二者都生效或都未生效的状态，绝不依赖
+退出清理。失败提交保留原事务与重试能力：记录 INSERT 随 SAVEPOINT
+回滚撤销，重试时重新写入，绝不重复记录。旧版库（无 timeline 表）
+首次加载保留现值，以空时间线为基线。
 
 脚本逐步执行：页面与 HTTP 可装载 1～50 步的 JSON 数组（POST
 /api/experiments/<id>/script），每步含 side（a/b）与 op
@@ -109,6 +109,23 @@ in_transaction，与手工 BEGIN 严格互斥：手工 BEGIN 先成功则装载 
 脚本 ID 与当前不符（旧脚本的过期请求，包括已被新脚本替换后）、脚本
 已结束 / 取消、步号与当前步不一致，一律 409，不执行、不产生记录、
 不影响新脚本。
+
+只读 SQL 工作台：页面与 HTTP 可提交 1～4000 字符的单条 SELECT / WITH
+查询（POST /api/experiments/<id>/query，body {"sql": "..."}）。文本
+校验先剥离字符串字面量、引用标识符与注释再扫描：只允许一条 SELECT /
+WITH（分号仅可出现在末尾），禁止写入、PRAGMA、ATTACH 与扩展加载；
+执行时另有独立只读连接（PRAGMA query_only=1）与只读授权器（仅放行
+SELECT / READ / RECURSIVE 及非 load_extension 的 FUNCTION）双重保证，
+任何写操作都不可能生效。每实验只保留最新查询：运行中再提交返回 409；
+提交立即返回查询 ID，执行在后台线程的独立只读连接上进行，不触碰两栏
+长期连接与 observer——两栏事务、读快照与最近显式读值都不受影响。
+结果含列名、前 100 行与截断标志，整数沿用无损编码，BLOB 转十六进制。
+取消（POST …/query/<query_id>/cancel）真实中断 SQL（conn.interrupt），
+尚未开跑也取消；终态一律在连接关闭后才公布：取消先被确认则不得成功，
+已终结则不改结果。每实验只保留最新查询，旧查询 ID（已被新查询替换）
+一律 404，不影响新查询。删除实验先取消在途查询、等连接关闭再删文件，
+不阻塞其他实验；失败或取消不改值及时间线。查询状态只保存在内存，
+不跨重启保留。
 """
 
 import json
@@ -148,6 +165,20 @@ SHM_SUFFIX = "-shm"
 # 数据目录中实验库文件名：exp_<12 位十六进制>.db（与 uuid4().hex[:12] 一致）
 EXP_DB_PATTERN = re.compile(r"exp_([0-9a-f]{12})\.db")
 
+# 只读 SQL 工作台：SQL 限 1～4000 字符，只许一条 SELECT / WITH 查询
+MAX_QUERY_SQL_LEN = 4000
+# 结果只返回前 100 行，truncated 标记是否还有剩余
+MAX_QUERY_ROWS = 100
+# 文本校验禁止的关键字（写入 / PRAGMA / ATTACH / 扩展加载）；
+# 字符串字面量、引用标识符与注释先剥离，再按整词扫描
+FORBIDDEN_SQL_KEYWORDS = {
+    "pragma", "attach", "detach", "insert", "update", "delete", "create",
+    "drop", "alter", "replace", "vacuum", "reindex", "analyze",
+    "load_extension",
+}
+# Python 3.6+ 提供 SQLITE_RECURSIVE；防御性回退到数值 33
+SQLITE_RECURSIVE = getattr(sqlite3, "SQLITE_RECURSIVE", 33)
+
 app = Flask(__name__)
 
 
@@ -169,6 +200,98 @@ def parse_int(raw):
     if isinstance(raw, str) and INT_PATTERN.fullmatch(raw.strip()):
         return int(raw.strip())
     return None
+
+
+def strip_sql_literals(sql):
+    """把字符串字面量、引用标识符与注释替换为空格，供关键字扫描使用。
+
+    单 / 双引号与反引号按 SQL 规则处理（相邻两个引号是转义），[...] 为
+    引用标识符；-- 与 /* */ 为注释。返回文本中剩下的分号与关键字都是
+    真实的语句结构，`SELECT ';'` 之类的字面量不会干扰校验。
+    """
+    out = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in "'\"`":
+            quote = ch
+            i += 1
+            while i < n:
+                if sql[i] == quote:
+                    if i + 1 < n and sql[i + 1] == quote:
+                        i += 2  # 转义的引号
+                        continue
+                    i += 1
+                    break
+                i += 1
+            out.append(" ")
+        elif ch == "[":
+            end = sql.find("]", i + 1)
+            i = n if end < 0 else end + 1
+            out.append(" ")
+        elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            end = sql.find("\n", i + 2)
+            i = n if end < 0 else end + 1
+            out.append(" ")
+        elif ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            end = sql.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            out.append(" ")
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def validate_query_sql(sql):
+    """校验只读查询：1～4000 字符、单条 SELECT / WITH，禁止写入、PRAGMA、
+    ATTACH 与扩展加载。返回错误消息（HTTP 400）或 None。
+
+    文本校验只是第一道门：执行时另有 PRAGMA query_only=1 与只读授权器
+    双重保证（见 readonly_query_authorizer），任何写操作都不可能生效。
+    """
+    if not isinstance(sql, str):
+        return "sql must be a string"
+    if not sql.strip() or len(sql) > MAX_QUERY_SQL_LEN:
+        return "sql must be 1..%d characters" % MAX_QUERY_SQL_LEN
+    body = strip_sql_literals(sql).strip()
+    # 单条语句：分号只允许在末尾出现一个（可选）
+    if body.endswith(";"):
+        body = body[:-1].strip()
+    if ";" in body:
+        return "only a single SELECT/WITH statement is allowed"
+    first = re.match(r"[A-Za-z_]+", body)
+    if first is None or first.group(0).lower() not in ("select", "with"):
+        return "only SELECT/WITH queries are allowed"
+    for word in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", body):
+        if word.lower() in FORBIDDEN_SQL_KEYWORDS:
+            return "forbidden keyword: %s" % word.lower()
+    return None
+
+
+def encode_query_value(value):
+    """查询结果单元格编码：整数沿用无损约定（超出安全整数范围用十进制
+    字符串），BLOB 转十六进制字符串，NULL / REAL / TEXT 原样。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return json_int(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex().upper()
+    return value
+
+
+def readonly_query_authorizer(action, arg1, arg2, _db_name, _source):
+    """只读授权器：仅放行 SELECT 语句、读列、递归 CTE 与非扩展加载的函数。
+
+    写入、PRAGMA、ATTACH、load_extension 等一律 SQLITE_DENY——即使文本
+    校验被绕过，独立只读连接上也不可能发生写入或扩展加载。
+    """
+    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, SQLITE_RECURSIVE):
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_FUNCTION:
+        if (arg2 or arg1 or "").lower() == "load_extension":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
 
 
 def timeline_public_view(record):
@@ -285,6 +408,12 @@ class Experiment:
         self.manual_cond = threading.Condition(self.script_lock)
         self.manual_active = {"a": 0, "b": 0}
         self.script = None  # None 或 {id, steps, cursor, records, status}
+        # 只读 SQL 工作台：每实验只保留最新查询（None 或查询字典），
+        # 只保存在内存，不跨重启保留。query_lock 串行化提交 / 取消 / 终态
+        # 公布；执行在后台线程的独立只读连接上进行，不触碰两栏长期连接
+        # 与 observer（两栏事务、读快照、最近显式读值都不受影响）。
+        self.query_lock = threading.Lock()
+        self.query = None
 
     def _init_db(self):
         """建库 / 打开已有库，返回从 timeline 表加载的提交时间线。
@@ -648,6 +777,196 @@ class Experiment:
         # 占住准入名额并阻塞随后的脚本查询、推进与删除。
         return self.script is not None and self.script["status"] == "active"
 
+    # ---------- 只读 SQL 工作台 ----------
+
+    @staticmethod
+    def query_view_locked(query):
+        """查询对外视图（调用方须持有 query_lock）。
+
+        运行中附带取消确认标志；成功含列名、前 100 行（已编码）与截断
+        标志；失败含原始 SQLite 错误名 / 错误码；取消无结果字段。
+        """
+        view = {"id": query["id"], "status": query["status"], "sql": query["sql"]}
+        if query["status"] == "running":
+            view["cancel_requested"] = query["cancel_requested"]
+        elif query["status"] == "success":
+            view["columns"] = list(query["columns"])
+            view["rows"] = [list(row) for row in query["rows"]]
+            view["truncated"] = query["truncated"]
+        elif query["status"] == "failed":
+            view["error"] = dict(query["error"])
+        return view
+
+    def query_state(self):
+        # 当前（最新）查询视图；无查询返回 None。只读内存，不执行任何 SQL
+        with self.query_lock:
+            return None if self.query is None else self.query_view_locked(self.query)
+
+    def query_by_id(self, query_id):
+        # 每实验只保留最新查询：旧查询 ID（已被替换）与未知 ID 一律
+        # 返回 None（HTTP 404），不影响新查询
+        with self.query_lock:
+            if self.query is None or self.query["id"] != query_id:
+                return None
+            return self.query_view_locked(self.query)
+
+    def submit_query(self, sql):
+        """提交新查询：立即返回查询视图（含查询 ID），执行在后台线程。
+
+        仅当前一个查询已终结（成功 / 失败 / 取消）或不存在时才接受；
+        运行中再提交返回冲突（HTTP 409，附当前查询视图）。接受后新查询
+        替换旧查询，旧查询 ID 此后一律 404。调用方已完成文本校验。
+        """
+        with self.query_lock:
+            if self.query is not None and self.query["status"] == "running":
+                return None, {
+                    "error": "a query is already running",
+                    "query": self.query_view_locked(self.query),
+                }
+            query = {
+                "id": uuid.uuid4().hex[:12],
+                "sql": sql,
+                "status": "running",  # running / success / failed / cancelled
+                "cancel_requested": False,
+                # 执行连接：发布供取消方 interrupt；worker 关闭后清回 None
+                "conn": None,
+                # 连接关闭、终态公布后置位：删除据此等待在途查询收尾
+                "done": threading.Event(),
+                "columns": None,
+                "rows": None,
+                "truncated": None,
+                "error": None,
+            }
+            self.query = query
+            view = self.query_view_locked(query)
+        # 守护线程：进程退出不等待；查询状态本就不跨重启保留
+        threading.Thread(
+            target=self._query_worker, args=(query,), daemon=True
+        ).start()
+        return view, None
+
+    def cancel_query(self, query_id):
+        """取消查询：真实中断 SQL（conn.interrupt），尚未开跑也取消。
+
+        查询 ID 与当前不符（旧查询 ID / 未知 ID）返回 None（HTTP 404）；
+        已终结则不改结果，原样返回当前视图。取消确认（cancel_requested）
+        后 worker 在连接关闭后公布「已取消」：取消先被确认则不得成功。
+        """
+        with self.query_lock:
+            query = self.query
+            if query is None or query["id"] != query_id:
+                return None
+            if query["status"] != "running":
+                # 已终结则不改结果
+                return self.query_view_locked(query)
+            query["cancel_requested"] = True
+            conn = query["conn"]
+        # interrupt 线程安全，在锁外调用；尚未开跑（conn 尚未发布）时
+        # 由 worker 启动前的取消检查兜底
+        if conn is not None:
+            conn.interrupt()
+        with self.query_lock:
+            return self.query_view_locked(query)
+
+    def cancel_query_and_wait(self):
+        """删除用：取消在途查询并等待其连接关闭、终态公布。
+
+        与 cancel_query 相同的「确认 + interrupt」；随后等待 worker 的
+        done（连接关闭、终态公布后才置位），保证删除数据库文件时不存在
+        在途的查询连接。没有运行中的查询时立即返回。
+        """
+        with self.query_lock:
+            query = self.query
+            if query is None or query["status"] != "running":
+                return
+            query["cancel_requested"] = True
+            conn = query["conn"]
+            done = query["done"]
+        if conn is not None:
+            conn.interrupt()
+        done.wait()
+
+    def _execute_query(self, conn, sql):
+        """在只读连接上真实执行查询，返回 (outcome, payload)。
+
+        成功：("success", (列名, 前 100 行原始值, 截断标志))；
+        失败：("failed", {name, code, message})，如实携带 SQLite 错误。
+        """
+        try:
+            cur = conn.execute(sql)
+            columns = [col[0] for col in cur.description or []]
+            rows = cur.fetchmany(MAX_QUERY_ROWS + 1)
+            truncated = len(rows) > MAX_QUERY_ROWS
+            return "success", (columns, rows[:MAX_QUERY_ROWS], truncated)
+        except sqlite3.Error as exc:
+            name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+            code = getattr(exc, "sqlite_errorcode", None)
+            return "failed", {"name": name, "code": code, "message": str(exc)}
+
+    def _query_worker(self, query):
+        """查询执行线程：独立只读连接真实执行，连接关闭后才公布终态。
+
+        取消先被确认则不得成功：开跑前已确认则不再执行；执行中被
+        conn.interrupt() 真实中断（SQLITE_INTERRUPT）；执行完成但公布前
+        取消被确认，结果作废改公布取消。终态（成功 / 失败 / 取消）一律
+        在连接关闭后、query_lock 内公布，随后置位 done 供删除等待。
+        """
+        conn = None
+        outcome = None
+        try:
+            # 独立只读连接：不用两栏长期连接与 observer，查询不触碰
+            # 两栏事务、读快照与最近显式读值；query_only + 只读授权器
+            # 双重保证绝不写入；busy_timeout=0 不等待任何锁
+            conn = sqlite3.connect(
+                self.db_path, timeout=0, isolation_level=None
+            )
+            conn.execute("PRAGMA busy_timeout=0")
+            conn.execute("PRAGMA query_only=1")
+            conn.set_authorizer(readonly_query_authorizer)
+            with self.query_lock:
+                query["conn"] = conn  # 发布供取消方 interrupt
+                cancel_seen = query["cancel_requested"]
+            if cancel_seen:
+                # 尚未开跑已被取消：不再执行
+                outcome = ("cancelled", None)
+            else:
+                outcome = self._execute_query(conn, query["sql"])
+        except Exception as exc:  # 含 sqlite3.Error；任何异常都必须走向终态公布
+            name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+            code = getattr(exc, "sqlite_errorcode", None)
+            outcome = ("failed", {"name": name, "code": code, "message": str(exc)})
+        finally:
+            if conn is not None:
+                conn.close()
+            if outcome is None:
+                # 防御：任何路径都必须公布终态并置位 done，
+                # 否则删除会在等待在途查询时永久卡住
+                outcome = ("failed", {
+                    "name": "SQLITE_ERROR",
+                    "code": None,
+                    "message": "query worker failed",
+                })
+            # 连接关闭后才公布终态；取消先被确认则不得成功
+            with self.query_lock:
+                if query["cancel_requested"]:
+                    query["status"] = "cancelled"
+                elif outcome[0] == "success":
+                    columns, rows, truncated = outcome[1]
+                    query["columns"] = columns
+                    query["rows"] = [
+                        [encode_query_value(value) for value in row]
+                        for row in rows
+                    ]
+                    query["truncated"] = truncated
+                    query["status"] = "success"
+                elif outcome[0] == "failed":
+                    query["error"] = outcome[1]
+                    query["status"] = "failed"
+                else:
+                    query["status"] = "cancelled"
+                query["conn"] = None
+                query["done"].set()
+
     def checkpoint_state(self):
         # 只读内存缓存：不执行任何 SQL、不触发检查点
         return {"last": self.checkpoint_last, "log": list(self.checkpoint_log)}
@@ -720,10 +1039,14 @@ class Experiment:
     def teardown(self):
         """删除的拆除阶段：必须在 begin_delete 之后调用。
 
-        先回滚两栏未提交事务，再依次关闭甲、乙长期连接与 observer；
-        全部关闭后才移除数据库及 WAL、SHM 文件。此时不可能有在途请求
-        或在途检查点连接，因此检查点不会在删除后重新创建文件。
+        先取消在途查询并等其连接关闭（终态公布），再回滚两栏未提交事务，
+        依次关闭甲、乙长期连接与 observer；全部关闭后才移除数据库及
+        WAL、SHM 文件。此时不可能有在途请求或在途检查点 / 查询连接，
+        因此检查点与查询都不可能在删除后重新创建文件。
         """
+        # 先取消在途查询、等连接关闭再删文件；等待按实验独立，
+        # 不阻塞其他实验
+        self.cancel_query_and_wait()
         for side in ("a", "b"):
             with self.conn_locks[side]:
                 conn = self.conns[side]
@@ -1118,8 +1441,8 @@ def restore_experiments():
 
     已提交值就在 kv 表中；提交时间线从 timeline 表完整加载（含补偿
     关联与序号），编号接续；两栏重建为无事务、只读关闭、最近读值为空；
-    脚本、操作日志与检查点缓存不恢复（全新内存状态）。已删除实验的
-    库文件已移除，不会复活。损坏的库文件跳过，不影响其他实验恢复。
+    脚本、操作日志、检查点缓存与查询状态不恢复（全新内存状态）。已删除
+    实验的库文件已移除，不会复活。损坏的库文件跳过，不影响其他实验恢复。
     已在注册表中的 ID 跳过（幂等，可重复调用）。
     """
     for name in sorted(os.listdir(DATA_DIR)):
@@ -1201,6 +1524,8 @@ def experiment_status(exp_id):
                 "checkpoint": exp.checkpoint_state(),
                 "timeline": exp.timeline_records(),
                 "script": exp.script_state(),
+                # 只读 SQL 工作台的最新查询视图（只读内存，不执行任何 SQL）
+                "query": exp.query_state(),
             }
         )
     finally:
@@ -1340,6 +1665,72 @@ def experiment_script_cancel(exp_id):
         if rejected is not None:
             return jsonify(rejected), 409
         return jsonify({"ok": ok, "script": view})
+    finally:
+        exp.finish_call()
+
+
+@app.post("/api/experiments/<exp_id>/query")
+def experiment_query_submit(exp_id):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        data = request.get_json(silent=True)
+        sql = data.get("sql") if isinstance(data, dict) else None
+        # 文本校验：1～4000 字符、单条 SELECT / WITH，禁止写入 / PRAGMA /
+        # ATTACH / 扩展加载；执行时另有只读连接与授权器双重保证
+        invalid = validate_query_sql(sql)
+        if invalid is not None:
+            return jsonify({"error": invalid}), 400
+        # 运行中再提交 409（附当前查询视图）；新查询替换已终结的旧查询，
+        # 旧查询 ID 此后一律 404
+        view, conflict = exp.submit_query(sql)
+        if conflict is not None:
+            return jsonify(conflict), 409
+        return jsonify({"ok": True, "query": view})
+    finally:
+        exp.finish_call()
+
+
+@app.get("/api/experiments/<exp_id>/query")
+def experiment_query_current(exp_id):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        # 只读内存中的最新查询状态：不执行任何 SQL；无查询时 query 为 null
+        return jsonify({"query": exp.query_state()})
+    finally:
+        exp.finish_call()
+
+
+@app.get("/api/experiments/<exp_id>/query/<query_id>")
+def experiment_query_get(exp_id, query_id):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        view = exp.query_by_id(query_id)
+        if view is None:
+            # 旧查询 ID（已被新查询替换）或未知 ID：404，不影响新查询
+            return jsonify({"error": "query not found"}), 404
+        return jsonify({"query": view})
+    finally:
+        exp.finish_call()
+
+
+@app.post("/api/experiments/<exp_id>/query/<query_id>/cancel")
+def experiment_query_cancel(exp_id, query_id):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        # 取消真实中断 SQL，尚未开跑也取消；已终结则不改结果；
+        # 旧查询 ID / 未知 ID 返回 404
+        view = exp.cancel_query(query_id)
+        if view is None:
+            return jsonify({"error": "query not found"}), 404
+        return jsonify({"ok": True, "query": view})
     finally:
         exp.finish_call()
 
