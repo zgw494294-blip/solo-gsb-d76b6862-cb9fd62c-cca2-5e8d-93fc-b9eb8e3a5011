@@ -109,6 +109,42 @@ in_transaction，与手工 BEGIN 严格互斥：手工 BEGIN 先成功则装载 
 脚本 ID 与当前不符（旧脚本的过期请求，包括已被新脚本替换后）、脚本
 已结束 / 取消、步号与当前步不一致，一律 409，不执行、不产生记录、
 不影响新脚本。
+
+只读 SQL 工作台：页面与 HTTP 可对实验库提交一条只读 SQL（POST
+/api/experiments/<id>/query，body {"sql": "..."}），立即返回查询
+ID（12 位十六进制）。SQL 限 1～4000 字符（按字符数，含空白），必须是
+**单独一条** SELECT 或 WITH 读查询：允许结尾分号，禁止多条语句，写入
+（INSERT/UPDATE/DELETE 等）、PRAGMA（含 pragma 函数表）、ATTACH/
+DETACH、扩展加载（load_extension）以及 EXPLAIN 等非 SELECT 开头语句
+一律 400。执行用**全新的独立只读连接**（URI mode=ro + PRAGMA
+query_only=1 + set_authorizer 白名单三重限制），绝不触碰两栏长期
+连接与 observer：两栏事务、只读开关、读快照、最近显式读值、时间线都
+不受影响。提交前先用同类只读连接以 EXPLAIN 预编译做策略闸，非法 SQL
+在提交当时即 400，绝不入队；合法但运行时失败（如无此表）则查询状态
+为 failed 并附原始 SQLite 错误名 / 错误码。
+
+每实验只保留**最新一条**查询：已有查询处于 running 时再次提交返回
+409；上一条已终结（succeeded/failed/cancelled）时新提交直接替换它，
+旧查询 ID 立即返回 404（不影响新查询、不留墓碑）。查询状态有 running /
+succeeded / failed / cancelled 四种（GET …/query/<query_id>）：
+运行中可轮询；成功返回列名、**前 100 行**与 truncated 截断标志（超过
+100 行只取前 100 行并置 truncated=true）；整数沿用 json_int 无损约定
+（超出 ±2⁵³−1 用十进制字符串），BLOB 一律转成 X'…' 形式的小写十六进制
+文本。取消（POST …/query/<query_id>/cancel，空 JSON body 即可）必须
+**中断真实执行的 SQL**（连接 interrupt，递归 CTE 等长查询立即
+SQLITE_INTERRUPT）；**尚未开跑**（worker 尚未开始执行）的查询也必须
+能取消——worker 在打开连接前、执行前都复查取消标志。取消先被确认则
+绝不能成功：worker 在 SQL 返回后、**连接关闭之后**才发布终态，并再次
+复查取消标志。**连接关闭后才公布终态**（成功 / 失败 / 取消皆然），
+删除与取消请求等到的查询线程绝不可能再触碰数据库文件。对已终结查询
+再次取消返回 200 与原终态，**不改变结果**；旧查询 ID 查询 / 取消返回
+404。
+
+删除实验（DELETE /api/experiments/<id>）除原有流程外，先取消在途
+查询并等待其工作线程结束（连接已关闭、终态已发布），再回滚两栏
+事务、关闭连接、删除文件；查询不阻塞其他实验，失败或被取消的查询
+**不改值也不改时间线**。查询状态只保存在内存，服务重启后不恢复：
+旧查询 ID 对恢复后的实验返回 404，与「旧 ID 不影响新查询」一致。
 """
 
 import json
@@ -117,6 +153,7 @@ import re
 import sqlite3
 import threading
 import time
+import urllib.parse
 import uuid
 
 from flask import Flask, jsonify, render_template, request
@@ -148,6 +185,27 @@ SHM_SUFFIX = "-shm"
 # 数据目录中实验库文件名：exp_<12 位十六进制>.db（与 uuid4().hex[:12] 一致）
 EXP_DB_PATTERN = re.compile(r"exp_([0-9a-f]{12})\.db")
 
+# ---- 只读 SQL 工作台 ----
+MAX_SQL_LEN = 4000  # SQL 文本上限（按字符数，含空白）；下限 1（非空白）
+MAX_QUERY_ROWS = 100  # 成功查询最多返回前 100 行，超出置 truncated=true
+# sqlite3 authorizer 动作码（sqlite3.h，Python 仅暴露 OK/DENY/IGNORE）：
+# 只放行读相关动作，其余（写入 / PRAGMA / ATTACH / 函数等）一律拒绝
+AUTH_READ = 20
+AUTH_SELECT = 21
+AUTH_FUNCTION = 31
+AUTH_RECURSIVE = 33
+# 一条语句唯一允许的起始关键字：SELECT，或定义 CTE 的 WITH。
+# WITH 后的数据修改语句（WITH cte AS (...) DELETE/INSERT/UPDATE ...）
+# 还要在 CTE 括号之后复查下一个关键字必须是 SELECT；其余一切以
+# INSERT/UPDATE/DELETE/PRAGMA/ATTACH/EXPLAIN/... 开头的语句在词法层拒绝。
+SQL_LEAD_WORDS = frozenset(("select", "with"))
+# 任何位置都禁止出现的函数名：扩展加载与 PRAGMA 表值函数。
+# authorizer 拒绝这两类函数时 SQLite 只给通用 SQLITE_ERROR(1)，无法与
+# 「无此函数」等语义错误区分，因此在词法层显式拒绝；authorizer 仍作为
+# 纵深防御（参数化 / 视图等路径同样拦得住）。
+SQL_FORBIDDEN_FUNCS = frozenset(("load_extension",))
+SQL_FORBIDDEN_FUNC_PREFIXES = ("pragma_",)
+
 app = Flask(__name__)
 
 
@@ -168,6 +226,233 @@ def parse_int(raw):
         return raw
     if isinstance(raw, str) and INT_PATTERN.fullmatch(raw.strip()):
         return int(raw.strip())
+    return None
+
+
+def scan_single_read_sql(sql):
+    """词法扫描 SQL，确认它是**单独一条** SELECT / WITH 读查询。
+
+    只做词法层面的「条数 + 起始关键字」检查，不解析语义；策略的最终
+    判定由只读连接上的 authorizer（prepare_query_gate）兜底。规则：
+
+    - 空白 / 注释之外最多出现一个分号，且分号只能是整条语句的结尾
+      （允许结尾分号；分号前后都不得再有非空白 token，即空语句、多条
+      语句、分号后再写内容一律拒绝）；
+    - 第一个词法 token 必须是 SELECT 或 WITH；WITH 定义 CTE 后，跳过
+      平衡的 CTE 括号，真正语句的第一个关键字必须仍是 SELECT（据此在
+      词法层拒绝 WITH cte AS (...) DELETE/INSERT/UPDATE，不必等
+      authorizer）；
+    - 字符串（'…'，'' 为转义）、双引号 / 反引号 / [..] 标识符、行注释
+      （--）与块注释（/* … */，不嵌套）内的分号与关键字都不算数；
+      未闭合的引号 / 注释拒绝。
+
+    返回 None 表示通过；否则返回拒绝消息（调用方以 400 拒绝）。
+    """
+    tokens = []  # 引号 / 注释之外的词法 token：("kw", 小写词) / ("(", ) /
+                # (")", ) / (";", ) / ("x", )（其它，如数字 / 运算符）
+    n = len(sql)
+    i = 0
+    while i < n:
+        ch = sql[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            j = sql.find("\n", i + 2)
+            i = n if j == -1 else j + 1
+            continue
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            j = sql.find("*/", i + 2)
+            if j == -1:
+                return "unclosed block comment"
+            i = j + 2
+            continue
+        if ch in ("'", '"', "`"):
+            close = ch
+            doubled = close + close
+            j = i + 1
+            while True:
+                k = sql.find(close, j)
+                if k == -1:
+                    return "unclosed string or identifier literal"
+                if sql[k:k + 2] == doubled:
+                    j = k + 2
+                    continue
+                break
+            tokens.append(("x",))
+            i = k + 1
+            continue
+        if ch == "[":
+            j = sql.find("]", i + 1)
+            if j == -1:
+                return "unclosed bracketed identifier"
+            tokens.append(("x",))
+            i = j + 1
+            continue
+        if ch == ";":
+            if tokens and tokens[-1][0] == ";":
+                return "only a single SELECT/WITH statement is allowed"
+            tokens.append((";",))
+            i += 1
+            continue
+        if ch == "(":
+            tokens.append(("(",))
+            i += 1
+            continue
+        if ch == ")":
+            tokens.append((")",))
+            i += 1
+            continue
+        # 普通词：标识符 / 关键字（字母、下划线、$ 开头）或数字 / 运算符
+        if ch.isalpha() or ch == "_":
+            j = i + 1
+            while j < n and (sql[j].isalnum() or sql[j] in "_$"):
+                j += 1
+            tokens.append(("kw", sql[i:j].lower()))
+            i = j
+            continue
+        # 数字、运算符、句点、逗号等：记录为不透明 token（分号 / 括号 /
+        # 引号 / 注释已在前面单独处理），用于判定「分号前是否有语句」
+        tokens.append(("x",))
+        i += 1
+
+    # 分号只能有一个且必须在末尾：删掉结尾分号后不应再出现分号，
+    # 且分号前后都必须有真正的语句 token
+    while tokens and tokens[-1][0] == ";":
+        tokens.pop()
+        if tokens and tokens[-1][0] == ";":
+            return "only a single SELECT/WITH statement is allowed"
+    if any(tok[0] == ";" for tok in tokens):
+        return "only a single SELECT/WITH statement is allowed"
+    words = [tok[1] for tok in tokens if tok[0] == "kw"]
+    if not words:
+        return "SQL must be a single SELECT/WITH statement"
+    # 禁用函数（load_extension / pragma_* 表值函数）在词法层即拒绝：
+    # 字符串 / 引号标识符内的同名文本不会被扫描成关键字，故不会误伤
+    # 普通文本字面量
+    for word in words:
+        if word in SQL_FORBIDDEN_FUNCS or any(
+            word.startswith(prefix) for prefix in SQL_FORBIDDEN_FUNC_PREFIXES
+        ):
+            return "function is not allowed in read-only queries"
+    if words[0] not in SQL_LEAD_WORDS:
+        return "only a single SELECT/WITH statement is allowed"
+    if words[0] == "select":
+        return None
+    # WITH：跳过一个或多个 CTE 定义。每个 CTE 形如
+    # 名称 [(列…)] AS (主体)，多个 CTE 以逗号分隔；主体括号内（可嵌套
+    # 括号）的一切关键字都忽略。所有 CTE 之后的第一个词法关键字必须
+    # 仍是 SELECT——WITH cte AS (...) DELETE/INSERT/UPDATE 在词法层
+    # 即拒绝，不必等 authorizer。
+    idx = 0
+    length = len(tokens)
+    while True:
+        # 定位本 CTE 的 AS
+        while idx < length and not (tokens[idx][0] == "kw" and tokens[idx][1] == "as"):
+            idx += 1
+        if idx >= length:
+            return "WITH must be followed by a SELECT statement"
+        idx += 1
+        # 定位 AS 之后的主体起始括号
+        while idx < length and tokens[idx][0] != "(":
+            idx += 1
+        if idx >= length:
+            return "WITH must be followed by a SELECT statement"
+        depth = 0
+        while idx < length:
+            kind = tokens[idx][0]
+            if kind == "(":
+                depth += 1
+            elif kind == ")":
+                depth -= 1
+                if depth == 0:
+                    idx += 1
+                    break
+            idx += 1
+        # 主体结束后：跳过逗号（被扫描器记为不透明 token "x"）与空白；
+        # 见到下一个关键字即做最终判定。
+        while idx < length and tokens[idx][0] == "x":
+            idx += 1
+        if idx >= length:
+            return "WITH must be followed by a SELECT statement"
+        if tokens[idx][0] != "kw":
+            return "WITH must be followed by a SELECT statement"
+        if tokens[idx][1] == "select":
+            return None
+        # 形如「, cte2 AS (...)」的下一个 CTE：当前关键字是 CTE 名，
+        # 继续循环；其余关键字（delete/insert/update/...）一律拒绝
+        probe = idx + 1
+        while probe < length and not (
+            tokens[probe][0] == "kw" and tokens[probe][1] == "as"
+        ):
+            probe += 1
+        if probe < length:
+            idx += 1  # 越过 CTE 名，下一轮从它的 AS 解析
+            continue
+        return "only a single SELECT/WITH statement is allowed"
+
+
+def open_query_connection(db_path):
+    """打开一条**只读**查询连接（三重只读限制）。
+
+    1. URI mode=ro：从文件层禁止写，连接本身不可能修改主库 / WAL；
+    2. PRAGMA query_only=1：再由 SQLite 连接层拒绝任何写语句
+       （须在 set_authorizer 之前执行——PRAGMA 也受 authorizer 约束）；
+    3. set_authorizer 白名单：只允许读（READ）、SELECT 准备、递归 CTE
+       与普通函数；PRAGMA / ATTACH / 事务 / 一切写入动作返回 DENY，
+       load_extension 与 pragma_* 表值函数在函数动作上单独拒绝。
+    busy_timeout=0：查询遇到写锁 / 检查点冲突立即报错，不等待两栏。
+    """
+    uri = "file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(db_path))
+    conn = sqlite3.connect(
+        uri, uri=True, timeout=0, isolation_level=None, check_same_thread=False
+    )
+    conn.execute("PRAGMA busy_timeout=0")
+    conn.execute("PRAGMA query_only=1")
+
+    def query_authorizer(action, arg1, arg2, db_name, trigger):
+        if action in (AUTH_READ, AUTH_SELECT, AUTH_RECURSIVE):
+            return sqlite3.SQLITE_OK
+        if action == AUTH_FUNCTION:
+            # SQLITE_FUNCTION 回调：arg1 恒为 None，函数名在 arg2
+            fname = (arg2 or "").lower()
+            # 扩展加载绝不允许；pragma 函数表（pragma_*）等同 PRAGMA 拒绝。
+            # 其余普通函数（abs / coalesce / json / ...）放行。
+            if fname == "load_extension" or fname.startswith("pragma_"):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+    conn.set_authorizer(query_authorizer)
+    return conn
+
+
+def prepare_query_gate(db_path, sql):
+    """提交前策略闸：用只读连接以 EXPLAIN 预编译 SQL，不执行、不取行。
+
+    词法扫描（scan_single_read_sql）通过后再做这一步，只拦截**策略
+    违规**：authorizer 拒绝（SQLITE_AUTH，写入 / PRAGMA / ATTACH /
+    load_extension / 数据修改型 CTE）与 sqlite3 的多条语句 Warning 返回
+    拒绝消息（HTTP 400）。其余编译期错误（如「无此表 / 无此列」）**不
+    在此拒绝**——SQL 形式合法、只是运行时才失败的查询应当入队，worker
+    执行后状态为 failed 并附原始 SQLite 错误名 / 错误码。预编译只生成
+    执行计划，绝不运行用户语句，因此不产生结果、不建读快照。
+    """
+    try:
+        gate = open_query_connection(db_path)
+    except sqlite3.Error as exc:
+        return "cannot open read-only query connection: %s" % exc
+    try:
+        try:
+            gate.execute("EXPLAIN " + sql).close()
+        except sqlite3.Warning:
+            return "only a single SELECT/WITH statement is allowed"
+        except sqlite3.Error as exc:
+            code = getattr(exc, "sqlite_errorcode", None)
+            if code == 23:  # SQLITE_AUTH：authorizer 策略拒绝
+                return "SQL is not allowed: only a single read-only SELECT/WITH query"
+            # 语法 / 对象不存在等：放行给 worker，运行时如实记 failed
+    finally:
+        gate.close()
     return None
 
 
@@ -285,6 +570,15 @@ class Experiment:
         self.manual_cond = threading.Condition(self.script_lock)
         self.manual_active = {"a": 0, "b": 0}
         self.script = None  # None 或 {id, steps, cursor, records, status}
+        # 只读 SQL 工作台：每实验只保留最新一条查询（只保存在内存，
+        # 不跨重启恢复）。query_lock 同时保护 query_job 与 job 内取消
+        # 标志；query_cond 供取消 / 删除请求等待终态（连接关闭后才发布）。
+        # worker 用**全新的独立只读连接**执行，与两栏长期连接、observer、
+        # 检查点 / 补偿连接都无关；running 时再提交返回 409，终结后新
+        # 提交替换旧 job，旧查询 ID 一律 404。
+        self.query_lock = threading.Lock()
+        self.query_cond = threading.Condition(self.query_lock)
+        self.query_job = None
 
     def _init_db(self):
         """建库 / 打开已有库，返回从 timeline 表加载的提交时间线。
@@ -664,6 +958,240 @@ class Experiment:
         except OSError:
             return 0
 
+    # ================= 只读 SQL 工作台 =================
+
+    QUERY_TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
+
+    @staticmethod
+    def encode_query_cell(value):
+        """查询结果单元格编码：整数沿用 json_int 无损约定；BLOB 转成
+        X'…' 形式的小写十六进制文本（空 BLOB 为 X''）；None / float /
+        str 原样返回（JSON 无整数精度问题，REAL 为浮点数）。"""
+        if isinstance(value, bool):  # 防御：SQLite 不返回 bool
+            return value
+        if isinstance(value, int):
+            return json_int(value)
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return "X'%s'" % bytes(value).hex()
+        return value
+
+    def _query_view_locked(self, job):
+        """查询对外视图。调用方必须持有 query_lock。
+
+        running 只回 id/status/sql；succeeded 附 columns / rows /
+        truncated（前 100 行）；failed / cancelled 附 error（取消时
+        error 为 null）。终态字段只有在 worker 关闭连接之后才写入。
+        """
+        view = {"id": job["id"], "status": job["status"], "sql": job["sql"]}
+        if job["status"] == "succeeded":
+            view["columns"] = list(job["columns"])
+            view["rows"] = [[self.encode_query_cell(v) for v in row]
+                            for row in job["rows"]]
+            view["truncated"] = job["truncated"]
+        if job["status"] in ("failed", "cancelled"):
+            view["error"] = job.get("error")
+        return view
+
+    def submit_query(self, sql):
+        """提交一条只读查询。调用方已完成长度与策略校验。
+
+        每实验只保留最新一条：已有 running 查询返回 409 语义（不新建、
+        不影响在途查询）；无查询或上一条已终结则新建 job 并启动 worker，
+        旧 job（及其查询 ID）立即不可见——旧 ID 查询 / 取消返回 404。
+        返回 (view, rejected)：rejected 非 None 时调用方返回 409。
+        """
+        with self.query_lock:
+            current = self.query_job
+            if current is not None and current["status"] == "running":
+                return None, {
+                    "error": "a query is already running; cancel it or wait"
+                }
+            job = {
+                "id": uuid.uuid4().hex[:12],
+                "sql": sql,
+                "status": "running",  # running/succeeded/failed/cancelled
+                "cancel": False,      # 取消标志（取消请求在锁内置位）
+                "conn": None,         # worker 打开的只读连接（供 interrupt）
+                "error": None,
+            }
+            self.query_job = job
+            thread = threading.Thread(
+                target=self._run_query_job, args=(job,), daemon=True
+            )
+            job["thread"] = thread
+            thread.start()
+            return self._query_view_locked(job), None
+
+    def get_query(self, query_id):
+        """按 ID 取查询视图；不是当前最新查询（从未存在 / 已被新查询
+        替换 / 重启后内存清空）一律返回 None，调用方以 404 回应。"""
+        with self.query_lock:
+            job = self.query_job
+            if job is None or job["id"] != query_id:
+                return None
+            return self._query_view_locked(job)
+
+    def cancel_query(self, query_id):
+        """取消查询并等其进入终态（连接已关闭）。
+
+        - 旧 / 未知查询 ID：返回 ("missing", None)，调用方以 404 回应；
+        - 已终结（succeeded/failed/cancelled）：返回 ("terminal", view)，
+          不改变结果（取消先被确认则不可能走到这里——worker 发布终态前
+          会再查取消标志）；
+        - running：锁内置取消标志并对 worker 连接 interrupt（连接尚未
+          打开则只置标志，worker 在开连接 / 执行前自行复查），随后等待
+          终态发布，返回 ("terminal", cancelled 视图)。
+        """
+        with self.query_lock:
+            job = self.query_job
+            if job is None or job["id"] != query_id:
+                return "missing", None
+            if job["status"] in self.QUERY_TERMINAL_STATUSES:
+                return "terminal", self._query_view_locked(job)
+            job["cancel"] = True
+            conn = job.get("conn")
+            if conn is not None:
+                # 中断真实执行中的 SQL：长查询（如无界递归 CTE）立即
+                # 收到 SQLITE_INTERRUPT(9)
+                try:
+                    conn.interrupt()
+                except sqlite3.Error:
+                    pass
+            # 必须等到**本 job** 进入终态（worker 关闭连接后才发布）：
+            # 谓词同时要求 id 一致，避免其他查询的 notify（如上一条查询
+            # 终结、唤醒后被新提交替换）让等待提前返回。
+            current_id = job["id"]
+            self.query_cond.wait_for(
+                lambda: (
+                    self.query_job is not None
+                    and self.query_job["id"] == current_id
+                    and self.query_job["status"]
+                    in self.QUERY_TERMINAL_STATUSES
+                )
+                or self.query_job is not job
+            )
+            # 等待期间理论上不会被新提交替换（替换只发生在终结之后），
+            # 稳妥起见：若 job 已不是当前 job，按旧 ID 404 语义处理
+            if self.query_job is not job:
+                return "missing", None
+            return "terminal", self._query_view_locked(job)
+
+    def cancel_inflight_queries(self):
+        """删除拆除前调用：取消在途查询并等其工作线程结束。
+
+        先在锁内置取消标志、interrupt 真实 SQL，再在锁外 join，避免
+        worker 终态发布（需要取 query_lock）与本等待形成阻塞。必须在
+        关闭两栏连接与删除文件**之前**完成：worker 发布任何终态前都已
+        关闭自己的只读连接，因此 join 返回后绝不可能再触碰数据库文件。
+        """
+        with self.query_lock:
+            job = self.query_job
+            if job is None or job["status"] != "running":
+                return
+            job["cancel"] = True
+            conn = job.get("conn")
+            if conn is not None:
+                try:
+                    conn.interrupt()
+                except sqlite3.Error:
+                    pass
+            thread = job.get("thread")
+        if thread is not None:
+            thread.join()
+
+    def _publish_terminal(self, job, status, **fields):
+        """终态发布的唯一入口：调用方必须**已关闭查询连接**。
+
+        连接关闭后才在锁内公布终态并唤醒取消 / 删除等待者；取消标志在
+        最后一刻再复查一次——SQL 恰好跑完、但取消请求已先被确认时，
+        发布的终态仍是 cancelled（取消先被确认则绝不能成功）。
+        """
+        with self.query_lock:
+            if job["status"] != "running":
+                # 理论不可达：终态只发布一次；防御性直接返回现有终态
+                return
+            if job["cancel"] and status == "succeeded":
+                status = "cancelled"
+                fields = {}
+            job["status"] = status
+            for key, value in fields.items():
+                job[key] = value
+            self.query_cond.notify_all()
+
+    def _run_query_job(self, job):
+        """查询工作线程：独立只读连接执行，终态在连接关闭后才发布。
+
+        取消在三个时点生效：打开连接前、执行 SQL 前（尚未开跑也能
+        取消）、以及真实执行中（连接 interrupt 令长查询立即中断）。
+        无论成功 / 失败 / 取消都不改实验库的值与时间线。
+        """
+        sql = job["sql"]
+        if job["cancel"]:
+            self._publish_terminal(job, "cancelled", error=None)
+            return
+        conn = None
+        published = False
+        try:
+            conn = open_query_connection(self.db_path)
+            with self.query_lock:
+                job["conn"] = conn
+                # 打开连接期间取消可能已到（interrupt 时连接尚未登记，
+                # 错过 interrupt 的那次调用）：执行前再复查一次
+                cancelled = job["cancel"]
+            if cancelled:
+                # 尚未开跑就被取消：先关闭连接，关闭后才公布终态
+                conn.close()
+                self._publish_terminal(job, "cancelled", error=None)
+                published = True
+                return
+            cursor = conn.execute(sql)
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchmany(MAX_QUERY_ROWS + 1)
+            truncated = len(rows) > MAX_QUERY_ROWS
+            if truncated:
+                rows = rows[:MAX_QUERY_ROWS]
+            conn.close()
+            conn = None
+            self._publish_terminal(
+                job,
+                "succeeded",
+                columns=columns,
+                rows=rows,
+                truncated=truncated,
+            )
+            published = True
+        except sqlite3.Error as exc:
+            # 连接须先关闭，关闭后才公布终态（成功路径同理）
+            if conn is not None:
+                conn.close()
+            # 取消先被确认（worker 执行期间取消请求置位并 interrupt）：
+            # 即使 SQLite 返回的不是中断错误码，终态也必须是 cancelled；
+            # interrupt 引发的 SQLITE_INTERRUPT(9) 同样记 cancelled。
+            # 其余 SQLite 错误（无此表、被 authorizer 拒绝等）记 failed，
+            # 并如实附原始错误名 / 错误码。
+            code = getattr(exc, "sqlite_errorcode", None)
+            if job["cancel"] or code == 9:
+                self._publish_terminal(job, "cancelled", error=None)
+            else:
+                name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+                self._publish_terminal(
+                    job,
+                    "failed",
+                    error={"name": name, "code": code, "message": str(exc)},
+                )
+            published = True
+        finally:
+            # 防御性兜底：任何未发布终态的退出（如非 sqlite 异常路径）
+            # 都必须先关掉连接、给出终态，避免取消 / 删除等待者永久阻塞。
+            # 不预设 status：_publish_terminal 仍会据取消标志做最终裁决。
+            if not published:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+                self._publish_terminal(job, "failed", error=None)
+
     def admit_call(self):
         """请求准入：实验存活则计入 active_calls 并返回 True。
 
@@ -720,10 +1248,13 @@ class Experiment:
     def teardown(self):
         """删除的拆除阶段：必须在 begin_delete 之后调用。
 
-        先回滚两栏未提交事务，再依次关闭甲、乙长期连接与 observer；
-        全部关闭后才移除数据库及 WAL、SHM 文件。此时不可能有在途请求
-        或在途检查点连接，因此检查点不会在删除后重新创建文件。
+        先取消在途只读查询并等待其工作线程结束（worker 发布任何终态前
+        都已关闭自己的只读连接），再回滚两栏未提交事务，依次关闭甲、乙
+        长期连接与 observer；全部关闭后才移除数据库及 WAL、SHM 文件。
+        此时不可能有在途请求、在途查询或在途检查点连接，因此检查点 /
+        查询都不会在删除后重新创建文件。
         """
+        self.cancel_inflight_queries()
         for side in ("a", "b"):
             with self.conn_locks[side]:
                 conn = self.conns[side]
@@ -1351,6 +1882,74 @@ def experiment_committed(exp_id):
         return response
     try:
         return jsonify({"committed": json_int(exp.committed_value())})
+    finally:
+        exp.finish_call()
+
+
+@app.post("/api/experiments/<exp_id>/query")
+def experiment_query_submit(exp_id):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        data = request.get_json(silent=True)
+        # body 必须是含字符串 sql 的 JSON 对象；按字符数限 1～4000（非空白）
+        if not isinstance(data, dict) or not isinstance(data.get("sql"), str):
+            return jsonify({"error": "sql must be a string"}), 400
+        sql = data["sql"]
+        if not sql.strip():
+            return jsonify({"error": "sql must be 1..%d characters" % MAX_SQL_LEN}), 400
+        if len(sql) > MAX_SQL_LEN:
+            return (
+                jsonify({"error": "sql must be at most %d characters" % MAX_SQL_LEN}),
+                400,
+            )
+        # 词法层：必须单独一条 SELECT / WITH 读查询（写入 / PRAGMA /
+        # ATTACH / 多条语句等在此 400，绝不入队）
+        invalid = scan_single_read_sql(sql)
+        if invalid is not None:
+            return jsonify({"error": invalid}), 400
+        # 策略闸：只读连接 EXPLAIN 预编译，authorizer 拒绝写入 / PRAGMA /
+        # ATTACH / 扩展加载，数据修改型 CTE 在此以 SQLITE_AUTH 失败
+        rejected = prepare_query_gate(exp.db_path, sql)
+        if rejected is not None:
+            return jsonify({"error": rejected}), 400
+        # running 中再提交：409；上一条已终结则替换，旧 ID 随即 404
+        view, conflict = exp.submit_query(sql)
+        if conflict is not None:
+            return jsonify(conflict), 409
+        return jsonify({"query": view})
+    finally:
+        exp.finish_call()
+
+
+@app.get("/api/experiments/<exp_id>/query/<query_id>")
+def experiment_query_get(exp_id, query_id):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        view = exp.get_query(query_id)
+        if view is None:
+            # 旧查询 ID（已被新查询替换 / 重启后内存清空 / 从未存在）：404
+            return jsonify({"error": "query not found"}), 404
+        return jsonify({"query": view})
+    finally:
+        exp.finish_call()
+
+
+@app.post("/api/experiments/<exp_id>/query/<query_id>/cancel")
+def experiment_query_cancel(exp_id, query_id):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        outcome, view = exp.cancel_query(query_id)
+        if outcome == "missing":
+            return jsonify({"error": "query not found"}), 404
+        # 已终结：返回原终态（200），不改变成功 / 失败 / 取消结果；
+        # running：已中断真实 SQL 并等待连接关闭、终态发布后返回
+        return jsonify({"query": view})
     finally:
         exp.finish_call()
 

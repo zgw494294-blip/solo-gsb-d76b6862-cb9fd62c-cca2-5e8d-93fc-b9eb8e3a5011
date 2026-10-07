@@ -99,7 +99,31 @@
     <ol class="log script-log" id="script-records"></ol>
   </section>
 
+  <section class="sql-workbench" id="sql-workbench">
+    <h2>只读 SQL 工作台（独立只读连接 · 每实验只保留最新查询 · 可取消）</h2>
+    <p class="wb-hint">只接受 <b>1～4000 字符的单独一条 SELECT / WITH 读查询</b>（允许结尾分号）：
+       写入、<code>PRAGMA</code>、<code>ATTACH</code>、扩展加载与多条语句一律拒绝（<code>400</code>）。
+       查询在<b>全新的独立只读连接</b>上执行（URI 只读 + <code>query_only</code> + authorizer 三重限制），
+       <b>不触碰两栏事务、读快照、最近读值与时间线</b>，失败或取消都不改值。提交立即返回查询 ID，
+       可轮询 <b>运行中 / 成功 / 失败 / 取消</b>；成功只回<b>列名与前 100 行</b>（超出置截断标志），
+       整数无损显示，BLOB 显示为 <code>X'…'</code> 十六进制。运行中再提交返回 <code>409</code>，
+       新查询会替换上一条（旧 ID 返回 <code>404</code>）；查询不跨重启保留。</p>
+    <div class="controls">
+      <textarea id="wb-sql" rows="4" spellcheck="false"
+        placeholder="SELECT val FROM kv WHERE id = 1"></textarea>
+    </div>
+    <div class="controls">
+      <button type="button" id="wb-run">提交查询</button>
+      <button type="button" class="danger" id="wb-cancel">取消查询</button>
+      <span class="wb-state" id="wb-state">尚未提交查询</span>
+      <span class="wb-count" id="wb-count"></span>
+    </div>
+    <div class="error-box" id="error-wb" hidden></div>
+    <div class="wb-result" id="wb-result" hidden></div>
+  </section>
+
   <section class="checkpoint" id="checkpoint">
+    <h2>WAL 检查点（独立连接真实执行 <code>PRAGMA wal_checkpoint</code>，busy_timeout=0）</h2>
     <h2>WAL 检查点（独立连接真实执行 <code>PRAGMA wal_checkpoint</code>，busy_timeout=0）</h2>
     <div class="controls">
       <button type="button" id="ckpt-passive">PASSIVE 检查点</button>

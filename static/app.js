@@ -31,6 +31,13 @@ let scriptState = null;
 let scriptBusy = false;
 // 补偿请求在途：禁用时间线区块的补偿输入与按钮（不影响两栏与检查点）。
 let compensateBusy = false;
+// 只读 SQL 工作台：当前最新查询视图（null = 无查询）与请求在途标志。
+// wbQuery.id 用于轮询 / 取消；新查询提交后旧 ID 的迟到响应一律丢弃
+// （后端对旧 ID 回 404，前端亦不渲染）。查询轮询用独立定时器，与实验
+// 状态轮询分开：进入终态即停止，creating / 冻结期间不发请求。
+let wbQuery = null;
+let wbBusy = false; // 提交 / 取消请求在途
+let wbPollTimer = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -83,10 +90,15 @@ function freezeExperiment(reason) {
   $("checkpoint").classList.add("exp-frozen");
   $("timeline").classList.add("exp-frozen");
   $("script").classList.add("exp-frozen");
+  $("sql-workbench").classList.add("exp-frozen");
   scriptState = null;
   scriptBusy = false;
+  stopWbPolling();
+  wbQuery = null;
+  wbBusy = false;
   syncPanelControls();
   syncScriptControls();
+  syncWbControls();
   const note = $("deleted-note");
   note.textContent = reason;
   note.hidden = false;
@@ -110,6 +122,9 @@ async function createExperiment() {
   // 旧实验的操作入口全部保持禁用，创建成功前没有任何请求可以发到旧 ID。
   creating = true;
   stopPolling();
+  // 与状态轮询一致：创建期间立即停掉旧实验的查询轮询（回调虽有 creating
+  // 兜底，但定时器不再保留），创建成功后随新实验状态重新启动
+  stopWbPolling();
   // 解除旧实验冻结状态；创建请求完成前先保持控件禁用，
   // 避免在途点击把操作发到旧 expId。
   expFrozen = false;
@@ -119,15 +134,22 @@ async function createExperiment() {
   $("checkpoint").classList.remove("exp-frozen");
   $("timeline").classList.remove("exp-frozen");
   $("script").classList.remove("exp-frozen");
+  $("sql-workbench").classList.remove("exp-frozen");
   panelBusy.a = false;
   panelBusy.b = false;
   scriptState = null;
   scriptBusy = false;
+  stopWbPolling();
+  wbQuery = null;
+  wbBusy = false;
   setBusy("a", true);
   setBusy("b", true);
   setCheckpointBusy(true);
   setCompensateBusy(true);
   syncScriptControls();
+  // 创建请求在途：工作台一并禁用（创建成功后的复位在下方新 ID 段完成）
+  wbBusy = false;
+  syncWbControls();
   $("refresh-committed").disabled = true;
   $("delete-exp").disabled = true;
   $("exp-id").textContent = "…";
@@ -158,6 +180,7 @@ async function createExperiment() {
       setCheckpointBusy(false);
       setCompensateBusy(false);
       syncScriptControls();
+      syncWbControls();
       $("refresh-committed").disabled = false;
       $("delete-exp").disabled = false;
       // 立即拉一次旧实验状态，随后恢复轮询
@@ -220,6 +243,18 @@ async function createExperiment() {
   $("script-state").className = "script-state";
   $("script-records").innerHTML = "";
   clearError("script");
+  // 新实验工作台：清空查询 / 结果，恢复「提交」可用（SQL 文本框保留，
+  // 方便在不同实验间复用同一条只读查询）
+  wbQuery = null;
+  wbBusy = false;
+  stopWbPolling();
+  $("wb-state").textContent = "尚未提交查询";
+  $("wb-state").className = "wb-state";
+  $("wb-count").textContent = "";
+  $("wb-result").hidden = true;
+  $("wb-result").innerHTML = "";
+  clearError("wb");
+  syncWbControls();
 
   setBusy("a", false);
   setBusy("b", false);
@@ -975,6 +1010,267 @@ async function deleteCurrentExperiment() {
   }
 }
 
+// 只读 SQL 工作台的状态文案
+const WB_STATUS_LABELS = {
+  running: "运行中",
+  succeeded: "成功",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
+// 查询接口的 404 有两种含义：实验本身不存在（服务端重启，仅发生在不带
+// 查询 ID 的提交接口）应沿用自动新建；带查询 ID 的查询 / 取消接口 404
+// 表示查询 ID 已过期（被新查询替换 / 重启后内存清空），不应自动新建。
+// expScoped=true 的调用（提交）把 404 当实验缺失；其余按旧查询处理。
+class QueryNotFound extends Error {}
+
+async function fetchWbJson(path, options, expScoped = false) {
+  const resp = await fetch(path, options);
+  if (resp.status === 410) throw new ExpDeleted();
+  if (resp.status === 404) {
+    throw expScoped ? new ExpNotFound() : new QueryNotFound();
+  }
+  let body = null;
+  try {
+    body = await resp.json();
+  } catch (e) {
+    body = {};
+  }
+  if (resp.status === 409) throw new ScriptConflict((body && body.error) || "conflict");
+  if (!resp.ok) throw new Error("HTTP " + resp.status + (body && body.error ? "：" + body.error : ""));
+  return body;
+}
+
+function stopWbPolling() {
+  if (wbPollTimer !== null) {
+    clearInterval(wbPollTimer);
+    wbPollTimer = null;
+  }
+}
+
+function syncWbControls() {
+  // 创建中 / 冻结：全部禁用；有查询在途（running）时只能取消；
+  // 请求在途（提交 / 取消）时两个按钮都禁用。无查询或已终结时可提交。
+  const frozen = creating || expFrozen;
+  const running = !!(wbQuery && wbQuery.status === "running");
+  $("wb-run").disabled = frozen || wbBusy || running;
+  $("wb-cancel").disabled = frozen || wbBusy || !running;
+  $("wb-sql").disabled = frozen || wbBusy || running;
+}
+
+function renderWbResult(query) {
+  const resultEl = $("wb-result");
+  resultEl.innerHTML = "";
+  if (query.status === "succeeded") {
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for (const col of query.columns || []) {
+      const th = document.createElement("th");
+      th.textContent = col;
+      headRow.appendChild(th);
+    }
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    for (const row of query.rows || []) {
+      const tr = document.createElement("tr");
+      for (const cell of row) {
+        const td = document.createElement("td");
+        if (cell === null) {
+          td.textContent = "NULL";
+          td.classList.add("wb-null");
+        } else {
+          // 数字 / 字符串 / X'…' 十六进制 BLOB 均按文本无损渲染
+          td.textContent = String(cell);
+        }
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    resultEl.appendChild(table);
+    if ((query.rows || []).length === 0) {
+      const div = document.createElement("div");
+      div.className = "wb-count";
+      div.textContent = "结果集为空（0 行）";
+      resultEl.appendChild(div);
+    }
+    if (query.truncated) {
+      const div = document.createElement("div");
+      div.className = "wb-truncated";
+      div.textContent = "结果超过 100 行：仅显示前 100 行（truncated=true）。";
+      resultEl.appendChild(div);
+    }
+    resultEl.hidden = false;
+  } else {
+    resultEl.hidden = true;
+  }
+}
+
+function renderWb(query, adopt = false) {
+  // 渲染工作台状态与结果。默认（轮询 / 取消）只接受当前最新查询，旧 ID
+  // 的迟到响应丢弃；adopt=true 用于刚提交返回的查询——它本身就是新的
+  // 当前查询（此时本地仍持有上一条查询），必须接受并替换。
+  if (!query) return;
+  if (!adopt && wbQuery && query.id !== wbQuery.id) return;
+  wbQuery = query;
+  const stateEl = $("wb-state");
+  const label = WB_STATUS_LABELS[query.status] || query.status;
+  stateEl.textContent = `查询 ${query.id}：${label}`;
+  stateEl.className = "wb-state " + query.status;
+  const countEl = $("wb-count");
+  if (query.status === "succeeded") {
+    const n = (query.rows || []).length;
+    countEl.textContent = `列 ${(query.columns || []).length} · 返回 ${n} 行` +
+      (query.truncated ? "（已截断）" : "");
+  } else if (query.status === "failed" && query.error) {
+    countEl.textContent = query.error.name
+      ? `${query.error.name}（错误码 ${query.error.code}）`
+      : "";
+  } else {
+    countEl.textContent = "";
+  }
+  renderWbResult(query);
+  if (query.status === "running") {
+    startWbPolling();
+  } else {
+    stopWbPolling();
+    if (query.status === "failed" && query.error) {
+      showError("wb", query.error);
+    } else {
+      clearError("wb");
+    }
+  }
+  syncWbControls();
+}
+
+function startWbPolling() {
+  // 单一查询轮询定时器（700ms）；终态 / 新提交 / 冻结时停止
+  if (wbPollTimer !== null) return;
+  wbPollTimer = setInterval(() => {
+    if (creating || expFrozen || !wbQuery || wbQuery.status !== "running") {
+      stopWbPolling();
+      return;
+    }
+    pollWbQuery().catch(() => {});
+  }, 700);
+}
+
+async function pollWbQuery() {
+  if (!expId || creating || expFrozen || !wbQuery) return;
+  const id = wbQuery.id;
+  const gen = expGen;
+  try {
+    const data = await fetchWbJson(`/api/experiments/${expId}/query/${id}`);
+    if (gen !== expGen || expFrozen) return;
+    renderWb(data.query);
+  } catch (e) {
+    await handleWbError(e, gen, "");
+  }
+}
+
+async function doWbSubmit() {
+  if (creating || expFrozen) return;
+  const sql = $("wb-sql").value;
+  if (!sql.trim()) {
+    showError("wb", { name: null, code: null, message: "请输入 1～4000 字符的 SELECT / WITH 只读查询" });
+    return;
+  }
+  if (sql.length > 4000) {
+    showError("wb", { name: null, code: null, message: `SQL 长度 ${sql.length} 超过 4000 字符上限` });
+    return;
+  }
+  const gen = expGen;
+  stopWbPolling();
+  wbBusy = true;
+  clearError("wb");
+  syncWbControls();
+  try {
+    const data = await fetchWbJson(`/api/experiments/${expId}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sql }),
+    }, true);
+    if (gen !== expGen || expFrozen) return;
+    renderWb(data.query, true); // 新提交：adopt 为最新查询，running → 启动轮询
+  } catch (e) {
+    await handleWbError(e, gen, "提交查询失败：");
+  } finally {
+    if (gen === expGen && !expFrozen) {
+      wbBusy = false;
+      syncWbControls();
+    }
+  }
+}
+
+async function doWbCancel() {
+  if (creating || expFrozen || !wbQuery) return;
+  if (wbQuery.status !== "running") return;
+  const id = wbQuery.id;
+  const gen = expGen;
+  wbBusy = true;
+  clearError("wb");
+  syncWbControls();
+  try {
+    // 取消请求在服务端等到连接关闭、终态发布后才返回；返回即终态
+    const data = await fetchWbJson(`/api/experiments/${expId}/query/${id}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (gen !== expGen || expFrozen) return;
+    stopWbPolling();
+    renderWb(data.query);
+  } catch (e) {
+    await handleWbError(e, gen, "取消查询失败：");
+  } finally {
+    if (gen === expGen && !expFrozen) {
+      wbBusy = false;
+      syncWbControls();
+    }
+  }
+}
+
+async function handleWbError(e, gen, prefix) {
+  if (e instanceof ExpDeleted) {
+    if (gen === expGen) {
+      freezeExperiment(`实验 ${expId} 已删除（410）：SQL 工作台已冻结，可点击「新建实验」继续。`);
+    }
+    return;
+  }
+  if (e instanceof ExpNotFound) {
+    // 实验本身不存在（服务端重启）：沿用统一自动新建；新实验工作台为空
+    if (gen === expGen && !expFrozen) {
+      await newExperiment();
+    }
+    return;
+  }
+  if (gen !== expGen || expFrozen) return;
+  if (e instanceof QueryNotFound) {
+    // 查询 ID 已过期（被新查询替换 / 重启后内存清空）：停止轮询，
+    // 按「当前无查询」复位，绝不自动新建实验，也不影响新查询
+    stopWbPolling();
+    wbQuery = null;
+    wbBusy = false;
+    $("wb-state").textContent = "当前查询已失效（旧查询 ID，可能已被新查询替换）";
+    $("wb-state").className = "wb-state cancelled";
+    $("wb-count").textContent = "";
+    $("wb-result").hidden = true;
+    syncWbControls();
+    return;
+  }
+  if (e instanceof ScriptConflict) {
+    // running 中再提交：409，提示并继续轮询原查询（若在运行中）
+    showError("wb", { name: null, code: null, message: prefix + e.message });
+    if (wbQuery && wbQuery.status === "running") startWbPolling();
+    return;
+  }
+  wbBusy = false;
+  syncWbControls();
+  showError("wb", { name: null, code: null, message: prefix + "请求失败：" + e.message });
+}
+
 async function init() {
   bindPanel("a");
   bindPanel("b");
@@ -1014,6 +1310,14 @@ async function init() {
   $("script-cancel").addEventListener("click", () => {
     doScriptAction("cancel").catch(() => {});
   });
+  $("wb-run").addEventListener("click", () => {
+    doWbSubmit().catch(() => {});
+  });
+  $("wb-cancel").addEventListener("click", () => {
+    doWbCancel().catch(() => {});
+  });
+  // 初始（?exp= 或自动新建前）控件可用性：无查询时只可提交、不可取消
+  syncWbControls();
 
   const params = new URLSearchParams(location.search);
   const existing = params.get("exp");

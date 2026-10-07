@@ -141,6 +141,14 @@ function loadApp(search = "") {
     "script-state",
     "script-records",
     "error-script",
+    "sql-workbench",
+    "wb-sql",
+    "wb-run",
+    "wb-cancel",
+    "wb-state",
+    "wb-count",
+    "wb-result",
+    "error-wb",
   ]) {
     get(id);
   }
